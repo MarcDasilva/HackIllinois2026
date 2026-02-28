@@ -94,16 +94,15 @@ def _generate_reference_image(
     models_cache: Path,
     seed: int,
 ) -> Path:
-    """Generate a single clean orthographic-ish image via SD 2.1-base.
+    """Generate a reference image via SDXL-Turbo (1 step, ~2s on H100).
 
-    Deliberately avoids AutoPipelineForText2Image because that import triggers
-    diffusers.pipelines.hunyuandit which requires MT5Tokenizer from transformers
-    – a symbol that was removed from the transformers top-level in recent releases.
-    StableDiffusionPipeline (SD 1.x/2.x) is self-contained and avoids this chain.
+    SDXL-Turbo is a distilled model that produces good quality images in a
+    single denoising step — dramatically faster than SD 1.5 (25 steps).
+    Guidance scale must be 0.0 for Turbo (classifier-free guidance is off).
     """
     import torch
     import os
-    from diffusers import StableDiffusionPipeline
+    from diffusers import StableDiffusionXLPipeline
 
     hf_token = os.environ.get("HF_TOKEN")
 
@@ -111,34 +110,26 @@ def _generate_reference_image(
         f"{prompt}, single object, white background, studio lighting, "
         "photorealistic, no shadows, centered, 3/4 view, product photo"
     )
-    negative_prompt = (
-        "background, cluttered, multiple objects, text, watermark, cartoon, "
-        "sketch, low quality, blurry, deformed"
-    )
 
-    # SD 1.5 community re-upload: fully public, no HF token required.
-    # "runwayml/stable-diffusion-v1-5" is the canonical public model but has
-    # become gated intermittently; "Lykon/dreamshaper-8" is consistently open.
-    model_id = "Lykon/dreamshaper-8"
-    cache_dir = models_cache / "dreamshaper-8"
+    model_id  = "stabilityai/sdxl-turbo"
+    cache_dir = models_cache / "sdxl-turbo"
 
-    log.info("[TripoSR/SD] Loading %s (cache=%s)", model_id, cache_dir)
-    pipe = StableDiffusionPipeline.from_pretrained(
+    log.info("[TripoSR/SDXL-Turbo] Loading %s (cache=%s)", model_id, cache_dir)
+    pipe = StableDiffusionXLPipeline.from_pretrained(
         model_id,
         torch_dtype=torch.float16,
+        variant="fp16",
         cache_dir=str(cache_dir),
         token=hf_token,
-        safety_checker=None,          # skip NSFW checker – speeds up load
-        requires_safety_checker=False,
     ).to("cuda")
     pipe.set_progress_bar_config(disable=True)
 
     generator = torch.Generator("cuda").manual_seed(seed)
+    # Turbo: num_inference_steps=1, guidance_scale=0.0
     image = pipe(
         prompt=enhanced_prompt,
-        negative_prompt=negative_prompt,
-        num_inference_steps=25,
-        guidance_scale=7.5,
+        num_inference_steps=1,
+        guidance_scale=0.0,
         generator=generator,
         height=512,
         width=512,
@@ -146,7 +137,7 @@ def _generate_reference_image(
 
     img_path = out_dir / "reference_render.png"
     image.save(img_path)
-    log.info("[TripoSR/SD] Reference image saved: %s", img_path)
+    log.info("[TripoSR/SDXL-Turbo] Reference image saved: %s", img_path)
     return img_path
 
 
@@ -216,9 +207,9 @@ def _triposr_infer(image_path: Path, mesh_path: Path, models_cache: Path) -> Non
     log.info("[TripoSR] Running inference...")
     with torch.no_grad():
         scene_codes = model([image], device="cuda")
+        # resolution=128 is 4x faster than 256 with minimal quality loss on H100.
         # has_vertex_color=True bakes vertex colors from the triplane decoder.
-        # Pass threshold explicitly (default 25.0 matches TripoSR defaults).
-        meshes = model.extract_mesh(scene_codes, has_vertex_color=True, resolution=256)
+        meshes = model.extract_mesh(scene_codes, has_vertex_color=True, resolution=128)
 
     mesh = meshes[0]
     mesh.export(str(mesh_path))

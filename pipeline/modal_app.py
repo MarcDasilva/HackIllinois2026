@@ -76,8 +76,8 @@ gpu_image = (
     )
     .pip_install(
         "huggingface_hub",
-        "diffusers",
-        "transformers",
+        "diffusers>=0.27.0",   # SDXL-Turbo needs >=0.27
+        "transformers>=4.41,<5",
         "accelerate",
         "safetensors",
         "sentencepiece",
@@ -169,7 +169,7 @@ def generate_asset_spec(
     user_prompt: str,
     placement_hint: Optional[dict] = None,
 ) -> dict:
-    """Call Gemini to produce a deterministic asset_spec JSON."""
+    """Call Gemini to produce asset_spec JSON."""
     import os
     import re
     import time
@@ -178,7 +178,7 @@ def generate_asset_spec(
     from google.genai import errors as genai_errors
     from tenacity import (
         retry, stop_after_attempt,
-        wait_exponential, wait_fixed,
+        wait_exponential,
         retry_if_exception_type, before_sleep_log,
     )
 
@@ -190,10 +190,8 @@ def generate_asset_spec(
 
     prompt = build_prompt(world_context, user_prompt, placement_hint)
 
-    # Model cascade: prioritize currently available models for this project.
-    # gemini-2.5-flash is primary; fall back to lite variants when quota/model
-    # constraints require cascading.
-    MODELS = ["gemini-2.5-flash", "gemini-2.0-flash-lite", "gemini-2.0-flash-lite-001"]
+    # Model cascade: prefer currently available Gemini models.
+    MODELS = ["gemini-2.5-flash"]
 
     def _extract_retry_delay(exc: Exception) -> float:
         """Pull the server-suggested retryDelay out of a 429 error message."""
@@ -233,10 +231,14 @@ def generate_asset_spec(
     for model_name in MODELS:
         log.info("[Stage A] Trying model=%s run_id=%s", model_name, run_id)
 
+        class _DailyQuotaExhausted(Exception):
+            """Raised immediately when the daily free-tier quota is gone; not retried."""
+
         @retry(
+            # Only retry transient per-minute 429s; skip daily-exhausted and 404.
             retry=retry_if_exception_type(genai_errors.ClientError),
-            stop=stop_after_attempt(5),
-            wait=wait_exponential(multiplier=2, min=10, max=120),
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=5, max=60),
             reraise=True,
             before_sleep=before_sleep_log(log, logging.WARNING),
         )
@@ -256,16 +258,22 @@ def generate_asset_spec(
                 return response.text
             except genai_errors.ClientError as exc:
                 if _is_not_found(exc):
-                    # 404 = wrong API version or model name; do not retry
+                    # 404 = wrong model name; do not retry
                     log.error(
-                        "[Stage A] 404 for model=%s – skipping (check model name/API version)",
+                        "[Stage A] 404 for model=%s – skipping", model,
+                    )
+                    raise _DailyQuotaExhausted(str(exc)) from exc
+                if _is_daily_exhausted(exc):
+                    # Daily quota gone – cascade immediately, no sleep/retry
+                    log.warning(
+                        "[Stage A] Daily quota exhausted for model=%s – cascading now",
                         model,
                     )
-                    raise
+                    raise _DailyQuotaExhausted(str(exc)) from exc
                 if _is_rate_limit(exc):
                     delay = _extract_retry_delay(exc)
                     log.warning(
-                        "[Stage A] 429 on model=%s – sleeping %.1fs (server hint)",
+                        "[Stage A] 429 (per-minute) on model=%s – sleeping %.1fs",
                         model, delay,
                     )
                     time.sleep(delay)
@@ -274,21 +282,16 @@ def generate_asset_spec(
         try:
             raw = _call()
             break   # success – stop trying further models
+        except _DailyQuotaExhausted as exc:
+            last_exc = exc
+            log.warning(
+                "[Stage A] model=%s quota/404 – cascading to next model",
+                model_name,
+            )
+            continue   # immediate cascade; no sleep
         except genai_errors.ClientError as exc:
             last_exc = exc
-            if _is_daily_exhausted(exc):
-                log.warning(
-                    "[Stage A] Daily quota exhausted for model=%s, trying next model",
-                    model_name,
-                )
-                continue   # cascade to next model
-            if _is_not_found(exc):
-                log.warning(
-                    "[Stage A] model=%s returned 404, trying next model",
-                    model_name,
-                )
-                continue   # cascade instead of crashing
-            raise   # other error – surface immediately
+            raise   # unexpected error – surface immediately
 
     if raw is None:
         raise RuntimeError(
@@ -313,18 +316,75 @@ def generate_asset_spec(
 
 
 # ---------------------------------------------------------------------------
+# Weight pre-caching – run once at deploy time to warm the Modal Volume
+# ---------------------------------------------------------------------------
+@app.function(
+    image=gpu_image,
+    gpu="H100",
+    secrets=[hf_secret],
+    volumes={str(MODELS_PATH): volume_models},
+    timeout=1800,
+)
+def precache_weights():
+    """Download TripoSR and SDXL-Turbo weights into the wap-models volume.
+
+    Run manually after changes to model IDs:
+        modal run pipeline/modal_app.py::precache_weights
+    """
+    import os
+    from huggingface_hub import hf_hub_download, snapshot_download
+
+    hf_token = os.environ.get("HF_TOKEN")
+
+    # ── TripoSR ──────────────────────────────────────────────────────────────
+    triposr_cache = MODELS_PATH / "triposr"
+    triposr_cache.mkdir(parents=True, exist_ok=True)
+    log.info("[precache] Downloading TripoSR weights → %s", triposr_cache)
+    hf_hub_download(
+        repo_id="stabilityai/TripoSR",
+        filename="config.yaml",
+        cache_dir=str(triposr_cache),
+        token=hf_token,
+    )
+    hf_hub_download(
+        repo_id="stabilityai/TripoSR",
+        filename="model.ckpt",
+        cache_dir=str(triposr_cache),
+        token=hf_token,
+    )
+    log.info("[precache] TripoSR weights cached.")
+
+    # ── SDXL-Turbo ───────────────────────────────────────────────────────────
+    sdxl_cache = MODELS_PATH / "sdxl-turbo"
+    sdxl_cache.mkdir(parents=True, exist_ok=True)
+    log.info("[precache] Downloading SDXL-Turbo weights → %s", sdxl_cache)
+    snapshot_download(
+        repo_id="stabilityai/sdxl-turbo",
+        cache_dir=str(sdxl_cache),
+        token=hf_token,
+        ignore_patterns=["*.safetensors.index.json"],
+    )
+    log.info("[precache] SDXL-Turbo weights cached.")
+
+    volume_models.commit()
+    log.info("[precache] Volume committed. All weights ready.")
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
 # Stage B – generate_geometry (GPU, parallelised per candidate)
 # ---------------------------------------------------------------------------
 @app.function(
     image=gpu_image,
-    gpu="T4",
+    gpu="H100",
     secrets=[hf_secret],
     volumes={
         str(MODELS_PATH):  volume_models,
         str(OUTPUTS_PATH): volume_outputs,
     },
-    timeout=600,
+    timeout=300,
     retries=modal.Retries(max_retries=2, backoff_coefficient=2.0, initial_delay=5.0),
+    min_containers=1,
 )
 def generate_geometry(
     run_id: str,
@@ -358,16 +418,16 @@ def generate_geometry(
 
 
 # ---------------------------------------------------------------------------
-# Stage C – cleanup_and_pbr (CPU / Blender)
+# Stage C – cleanup_and_pbr (CPU, pure Python — no Blender)
 # ---------------------------------------------------------------------------
 @app.function(
-    image=blender_image,
-    cpu=4,
-    memory=8192,
+    image=base_image,
+    cpu=2,
+    memory=4096,
     volumes={
         str(OUTPUTS_PATH): volume_outputs,
     },
-    timeout=600,
+    timeout=120,
 )
 def cleanup_and_pbr(
     run_id: str,
@@ -375,36 +435,38 @@ def cleanup_and_pbr(
     raw_mesh_rel: str,
     asset_spec: dict,
 ) -> str:
-    """Run headless Blender cleanup + PBR baking. Returns relative path to cleaned .glb."""
-    import subprocess, shlex
+    """Fast trimesh-based cleanup + PBR GLB export (no Blender, no Cycles baking).
+    Returns relative path to cleaned .glb."""
+    import subprocess, sys
 
     raw_mesh_abs = OUTPUTS_PATH / raw_mesh_rel
     cand_dir     = OUTPUTS_PATH / run_id / f"candidate_{candidate_id:02d}"
     cleaned_glb  = cand_dir / "cleaned.glb"
+    cand_dir.mkdir(parents=True, exist_ok=True)
 
-    blender_script = Path(__file__).parent / "blender" / "cleanup_and_bake.py"
+    cleanup_script = Path(__file__).parent / "blender" / "cleanup_and_bake.py"
 
     spec_tmp = cand_dir / "asset_spec.json"
     spec_tmp.write_text(json.dumps(asset_spec))
 
-    cmd = (
-        f"blender --background --python {blender_script} -- "
-        f"--input {raw_mesh_abs} "
-        f"--output {cleaned_glb} "
-        f"--spec {spec_tmp}"
-    )
+    cmd = [
+        sys.executable, str(cleanup_script),
+        "--input",  str(raw_mesh_abs),
+        "--output", str(cleaned_glb),
+        "--spec",   str(spec_tmp),
+    ]
 
-    log.info("[Stage C] Running Blender: %s", cmd)
+    log.info("[Stage C] Running fast cleanup: %s", " ".join(cmd))
     result = subprocess.run(
-        shlex.split(cmd),
-        capture_output=True, text=True, timeout=540,
+        cmd,
+        capture_output=True, text=True, timeout=100,
     )
 
     if result.returncode != 0:
-        log.error("[Stage C] Blender stderr:\n%s", result.stderr[-3000:])
-        raise RuntimeError(f"Blender failed (rc={result.returncode})")
+        log.error("[Stage C] cleanup stderr:\n%s", result.stderr[-3000:])
+        raise RuntimeError(f"Mesh cleanup failed (rc={result.returncode})")
 
-    log.info("[Stage C] Blender stdout (tail):\n%s", result.stdout[-1000:])
+    log.info("[Stage C] cleanup stdout:\n%s", result.stdout[-1000:])
     volume_outputs.commit()
     return str(cleaned_glb.relative_to(OUTPUTS_PATH))
 
@@ -541,19 +603,36 @@ def run_pipeline(
         )
     )
 
-    # Stages C + D + E per candidate (sequential within each, parallel across candidates)
-    results = []
-    for cid, raw_rel in enumerate(raw_mesh_rels):
-        cleaned_rel  = cleanup_and_pbr.remote(run_id, cid, raw_rel, asset_spec)
-        report       = validate_asset.remote(run_id, cid, cleaned_rel, asset_spec, world_context)
-        patch        = placement_patch.remote(run_id, cid, cleaned_rel, asset_spec, world_context)
-        results.append({
-            "candidate_id":  cid,
-            "seed":          seeds[cid],
-            "cleaned_glb":   cleaned_rel,
-            "validation":    report,
-            "world_patch":   patch,
-        })
+    # Stages C + D + E per candidate
+    # Within each candidate D and E are independent (both need cleaned GLB).
+    # Across candidates all C+D+E fan-out concurrently via starmap.
+    #
+    # Strategy: run cleanup_and_pbr for all candidates first (they can share the
+    # GPU image's multi-container pool), then fan-out D+E together.
+    cleaned_rels = list(
+        cleanup_and_pbr.starmap(
+            [(run_id, cid, raw_rel, asset_spec) for cid, raw_rel in enumerate(raw_mesh_rels)]
+        )
+    )
+
+    # Fan out validate + placement in parallel across all candidates.
+    # zip the two starmap iterators together so D and E run concurrently.
+    validate_args  = [(run_id, cid, c_rel, asset_spec, world_context) for cid, c_rel in enumerate(cleaned_rels)]
+    placement_args = [(run_id, cid, c_rel, asset_spec, world_context) for cid, c_rel in enumerate(cleaned_rels)]
+
+    reports = list(validate_asset.starmap(validate_args))
+    patches = list(placement_patch.starmap(placement_args))
+
+    results = [
+        {
+            "candidate_id": cid,
+            "seed":         seeds[cid],
+            "cleaned_glb":  cleaned_rels[cid],
+            "validation":   reports[cid],
+            "world_patch":  patches[cid],
+        }
+        for cid in range(len(raw_mesh_rels))
+    ]
 
     # Rank: prefer passing candidates, then by score
     def _rank_key(r: dict) -> tuple:
@@ -703,61 +782,83 @@ async def _stream_pipeline(req: GenerateRequest):
         "progress": 45,
     })
 
-    # ── Stages C + D + E per candidate ───────────────────────────────────────
-    results = []
+    # ── Stages C + D + E — fully parallel ────────────────────────────────────
+    # All candidates' cleanup runs concurrently (starmap), then all validate
+    # and placement calls fan-out concurrently.  D and E are independent of
+    # each other so both starmaps are issued before we await either result.
     n = len(raw_mesh_rels)
-    for cid, raw_rel in enumerate(raw_mesh_rels):
-        base_pct = 45 + int((cid / n) * 45)
 
-        yield _sse("stage", {
-            "stage": "C",
-            "label": f"Cleaning mesh & baking PBR textures (candidate {cid})…",
-            "progress": base_pct + 2,
-            "candidate": cid,
-        })
-        try:
-            cleaned_rel = await asyncio.to_thread(
-                lambda: cleanup_and_pbr.remote(run_id, cid, raw_rel, asset_spec)
+    yield _sse("stage", {
+        "stage": "C",
+        "label": f"Cleaning mesh & baking PBR textures ({n} candidate(s) in parallel)…",
+        "progress": 48,
+    })
+    try:
+        cleaned_rels = await asyncio.to_thread(
+            lambda: list(
+                cleanup_and_pbr.starmap(
+                    [(run_id, cid, raw_rel, asset_spec)
+                     for cid, raw_rel in enumerate(raw_mesh_rels)]
+                )
             )
-        except Exception as exc:
-            yield _sse("error", {"stage": "C", "candidate": cid, "message": str(exc)})
-            return
+        )
+    except Exception as exc:
+        yield _sse("error", {"stage": "C", "message": str(exc)})
+        return
 
-        yield _sse("stage", {
-            "stage": "D",
-            "label": f"Validating asset (candidate {cid})…",
-            "progress": base_pct + 8,
-            "candidate": cid,
-        })
-        try:
-            report = await asyncio.to_thread(
-                lambda: validate_asset.remote(run_id, cid, cleaned_rel, asset_spec, req.world_context)
+    yield _sse("stage_done", {"stage": "C", "label": "Mesh cleanup done", "progress": 65})
+
+    yield _sse("stage", {
+        "stage": "D",
+        "label": f"Validating {n} candidate(s) in parallel…",
+        "progress": 67,
+    })
+    yield _sse("stage", {
+        "stage": "E",
+        "label": f"Computing world placement for {n} candidate(s) in parallel…",
+        "progress": 68,
+    })
+
+    # Fire D and E as concurrent asyncio tasks — both fan-out via starmap
+    async def _run_validate():
+        return await asyncio.to_thread(
+            lambda: list(
+                validate_asset.starmap(
+                    [(run_id, cid, c_rel, asset_spec, req.world_context)
+                     for cid, c_rel in enumerate(cleaned_rels)]
+                )
             )
-        except Exception as exc:
-            yield _sse("error", {"stage": "D", "candidate": cid, "message": str(exc)})
-            return
+        )
 
-        yield _sse("stage", {
-            "stage": "E",
-            "label": f"Computing world placement (candidate {cid})…",
-            "progress": base_pct + 12,
-            "candidate": cid,
-        })
-        try:
-            patch = await asyncio.to_thread(
-                lambda: placement_patch.remote(run_id, cid, cleaned_rel, asset_spec, req.world_context)
+    async def _run_placement():
+        return await asyncio.to_thread(
+            lambda: list(
+                placement_patch.starmap(
+                    [(run_id, cid, c_rel, asset_spec, req.world_context)
+                     for cid, c_rel in enumerate(cleaned_rels)]
+                )
             )
-        except Exception as exc:
-            yield _sse("error", {"stage": "E", "candidate": cid, "message": str(exc)})
-            return
+        )
 
-        results.append({
+    try:
+        reports, patches = await asyncio.gather(_run_validate(), _run_placement())
+    except Exception as exc:
+        yield _sse("error", {"stage": "D/E", "message": str(exc)})
+        return
+
+    yield _sse("stage_done", {"stage": "D", "label": "Validation complete", "progress": 88})
+    yield _sse("stage_done", {"stage": "E", "label": "Placement computed", "progress": 95})
+
+    results = [
+        {
             "candidate_id": cid,
-            "seed": seeds[cid],
-            "cleaned_glb": cleaned_rel,
-            "validation": report,
-            "world_patch": patch,
-        })
+            "seed":         seeds[cid],
+            "cleaned_glb":  cleaned_rels[cid],
+            "validation":   reports[cid],
+            "world_patch":  patches[cid],
+        }
+        for cid in range(n)
+    ]
 
     # ── Rank & select best ────────────────────────────────────────────────────
     def _rank_key(r: dict) -> tuple:
@@ -780,7 +881,7 @@ async def _stream_pipeline(req: GenerateRequest):
     summary_path = OUTPUTS_PATH / run_id / "pipeline_summary.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(json.dumps(summary, indent=2))
-    volume_outputs.commit()
+    await volume_outputs.commit.aio()
 
     cid_best = best["candidate_id"]
     yield _sse("done", {
@@ -808,6 +909,7 @@ def _register_routes(api):
 
     @api.get("/download/{run_id}/{candidate_folder}")
     async def download_glb(run_id: str, candidate_folder: str):
+        await volume_outputs.reload.aio()
         glb_path = OUTPUTS_PATH / run_id / candidate_folder / "cleaned.glb"
         if not glb_path.exists():
             raise HTTPException(status_code=404, detail="GLB not found")
@@ -838,8 +940,8 @@ if api is not None:
     },
     timeout=1800,
     secrets=[gemini_secret],
-    allow_concurrent_inputs=50,
 )
+@modal.concurrent(max_inputs=50)
 @modal.asgi_app()
 def web_api():
     return api

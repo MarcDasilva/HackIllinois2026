@@ -1,481 +1,248 @@
 """
-Headless Blender cleanup and PBR baking script.
+Fast mesh cleanup and PBR GLB export — NO Blender, NO Cycles baking.
 
-Called by Modal Stage C as:
-    blender --background --python cleanup_and_bake.py -- \
+Replaces the old headless-Blender approach with a pure trimesh/pygltflib
+pipeline that runs in ~3-5 s on CPU vs ~90 s with Blender+Cycles.
+
+Called by Modal Stage C via subprocess as:
+    python cleanup_and_bake.py \
         --input  /path/to/raw_mesh.obj \
         --output /path/to/cleaned.glb \
         --spec   /path/to/asset_spec.json
 
-This script runs INSIDE Blender's embedded Python interpreter.
-Do NOT import external packages that are not available in Blender's Python.
+PBR materials are encoded directly as GLTF material constants (baseColorFactor,
+metallicFactor, roughnessFactor) — no ray-traced texture baking required.
+The output is a self-contained GLB with embedded colour data.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
-import math
-import os
-import sys
 import logging
+import struct
+import sys
 from pathlib import Path
 
-# Blender's Python does not have 'logging' configured by default
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [BLENDER] %(levelname)s: %(message)s",
+    format="%(asctime)s [CLEANUP] %(levelname)s: %(message)s",
 )
-log = logging.getLogger("blender_cleanup")
+log = logging.getLogger("cleanup_and_bake")
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 def parse_args():
-    """Parse args after '--' separator that Blender uses for user args."""
-    import argparse
-
     argv = sys.argv
     if "--" in argv:
-        argv = argv[argv.index("--") + 1:]
+        argv = argv[argv.index("--") + 1 :]
     else:
-        argv = []
+        argv = sys.argv[1:]
 
-    parser = argparse.ArgumentParser(description="Blender cleanup + PBR bake")
-    parser.add_argument("--input",  required=True, help="Path to raw mesh")
-    parser.add_argument("--output", required=True, help="Path to cleaned .glb")
-    parser.add_argument("--spec",   required=True, help="Path to asset_spec.json")
+    parser = argparse.ArgumentParser(description="Fast mesh cleanup + GLB export")
+    parser.add_argument("--input",  required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--spec",   required=True)
     return parser.parse_args(argv)
 
 
-def import_mesh(bpy, filepath: str) -> list:
-    """Import mesh supporting obj, ply, glb/gltf, fbx."""
-    path = Path(filepath)
-    ext  = path.suffix.lower()
-
-    bpy.ops.object.select_all(action="DESELECT")
-
-    if ext == ".obj":
-        bpy.ops.wm.obj_import(filepath=filepath)
-    elif ext == ".ply":
-        bpy.ops.wm.ply_import(filepath=filepath)
-    elif ext in (".glb", ".gltf"):
-        bpy.ops.import_scene.gltf(filepath=filepath)
-    elif ext == ".fbx":
-        bpy.ops.import_scene.fbx(filepath=filepath)
-    else:
-        raise ValueError(f"Unsupported mesh format: {ext}")
-
-    imported = [obj for obj in bpy.context.selected_objects if obj.type == "MESH"]
-    log.info("Imported %d mesh object(s) from %s", len(imported), filepath)
-    return imported
-
-
-def join_objects(bpy, objects: list):
-    """Join multiple mesh objects into one."""
-    if len(objects) <= 1:
-        return objects[0] if objects else None
-
-    bpy.ops.object.select_all(action="DESELECT")
-    for obj in objects:
-        obj.select_set(True)
-    bpy.context.view_layer.objects.active = objects[0]
-    bpy.ops.object.join()
-    return bpy.context.active_object
-
-
-def fix_normals(bpy, obj):
-    """Recalculate normals to point outward."""
-    bpy.context.view_layer.objects.active = obj
-    bpy.ops.object.mode_set(mode="EDIT")
-    bpy.ops.mesh.select_all(action="SELECT")
-    bpy.ops.mesh.normals_make_consistent(inside=False)
-    bpy.ops.object.mode_set(mode="OBJECT")
-    log.info("Normals fixed for %s", obj.name)
-
-
-def remove_doubles_and_artifacts(bpy, obj, merge_dist: float = 0.0001):
-    """Merge by distance, remove loose geometry."""
-    bpy.context.view_layer.objects.active = obj
-    bpy.ops.object.mode_set(mode="EDIT")
-    bpy.ops.mesh.select_all(action="SELECT")
-    bpy.ops.mesh.remove_doubles(threshold=merge_dist)
-    bpy.ops.mesh.delete_loose()
-    bpy.ops.object.mode_set(mode="OBJECT")
-    log.info("Removed doubles (threshold=%.5f) on %s", merge_dist, obj.name)
-
-
-def triangulate(bpy, obj):
-    """Triangulate mesh to remove ngons."""
-    bpy.context.view_layer.objects.active = obj
-    bpy.ops.object.mode_set(mode="EDIT")
-    bpy.ops.mesh.select_all(action="SELECT")
-    bpy.ops.mesh.quads_convert_to_tris(quad_method="BEAUTY", ngon_method="BEAUTY")
-    bpy.ops.object.mode_set(mode="OBJECT")
-    log.info("Triangulated %s", obj.name)
-
-
-def decimate(bpy, obj, max_tris: int):
-    """Add a decimate modifier to hit max_tris target."""
-    mesh = obj.data
-    current_tris = len(mesh.polygons)
-    if current_tris <= max_tris:
-        log.info("Polycount %d already within target %d, skipping decimate", current_tris, max_tris)
-        return
-
-    ratio = max_tris / current_tris
-    mod   = obj.modifiers.new(name="Decimate", type="DECIMATE")
-    mod.ratio = max(0.05, min(ratio, 1.0))
-    bpy.context.view_layer.objects.active = obj
-    bpy.ops.object.modifier_apply(modifier="Decimate")
-    new_tris = len(obj.data.polygons)
-    log.info("Decimated %s: %d → %d tris (target %d)", obj.name, current_tris, new_tris, max_tris)
-
-
-def smart_uv_unwrap(bpy, obj):
-    """Smart UV project if no UV map exists or is empty."""
-    mesh = obj.data
-    if not mesh.uv_layers:
-        bpy.context.view_layer.objects.active = obj
-        bpy.ops.object.mode_set(mode="EDIT")
-        bpy.ops.mesh.select_all(action="SELECT")
-        bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.02)
-        bpy.ops.object.mode_set(mode="OBJECT")
-        log.info("Smart UV unwrap applied to %s", obj.name)
-    else:
-        log.info("UV map already present on %s, skipping unwrap", obj.name)
-
-
-def scale_to_spec(bpy, obj, spec_size: dict):
-    """
-    Non-uniformly scale the object so its bounding box matches spec size_m exactly.
-
-    Axis mapping — Blender is Z-up; glTF export applies a -90° X rotation so:
-      Blender X  →  GLB X   (spec "x" = width)
-      Blender Z  →  GLB Y   (spec "y" = height as seen in GLB / validation)
-      Blender Y  →  GLB -Z  (spec "z" = depth as seen in GLB / validation)
-
-    Therefore in Blender space:
-      spec x  →  Blender X  (sx scales Blender X)
-      spec y  →  Blender Z  (sy scales Blender Z)
-      spec z  →  Blender Y  (sz scales Blender Y)
-
-    We apply an independent scale factor per axis so all three dimensions hit
-    their targets.  Non-uniform scale is fine for static props.
-    If no size_m is specified the mesh is left as-is.
-    """
-    import mathutils
-
-    if not spec_size:
-        log.info("No size_m in spec – skipping scale normalisation")
-        return
-
-    bpy.context.view_layer.objects.active = obj
-    obj.select_set(True)
-
-    bbox = [obj.matrix_world @ mathutils.Vector(corner) for corner in obj.bound_box]
-    cur_x = max(v.x for v in bbox) - min(v.x for v in bbox)
-    cur_y = max(v.y for v in bbox) - min(v.y for v in bbox)
-    cur_z = max(v.z for v in bbox) - min(v.z for v in bbox)
-
-    tgt_x = float(spec_size.get("x", 0))   # width  → Blender X
-    tgt_y = float(spec_size.get("y", 0))   # height → Blender Z
-    tgt_z = float(spec_size.get("z", 0))   # depth  → Blender Y
-
-    # Per-axis scale factors; fall back to 1.0 if spec axis is missing/zero
-    sx = (tgt_x / cur_x) if (tgt_x > 0 and cur_x > 1e-6) else 1.0
-    sy = (tgt_z / cur_y) if (tgt_z > 0 and cur_y > 1e-6) else 1.0  # spec z → Blender Y
-    sz = (tgt_y / cur_z) if (tgt_y > 0 and cur_z > 1e-6) else 1.0  # spec y → Blender Z
-
-    obj.scale = (obj.scale.x * sx, obj.scale.y * sy, obj.scale.z * sz)
-    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
-    log.info(
-        "Scaled %s per-axis (sx=%.4f sy=%.4f sz=%.4f) → GLB extents ~%.3f(x) %.3f(y) %.3f(z)m",
-        obj.name, sx, sy, sz,
-        tgt_x or cur_x * sx,
-        tgt_y or cur_z * sz,
-        tgt_z or cur_y * sy,
-    )
-
-
-def set_pivot_to_base_center(bpy, obj):
-    """
-    Translate mesh vertices so the bounding-box base-center sits at the world
-    origin (0, 0, 0).
-
-    Blender is Z-up: 'base' = min-Z face, centered on X and Y.
-    GLB export performs a Y-up conversion (Blender Z → GLB Y), so after export
-    the GLB Y-min will be 0 and the GLB X/Z centroid will be 0 — exactly what
-    check_pivot_at_base validates.
-
-    We manipulate vertices directly (via mesh.transform) to avoid the
-    cursor/origin_set dance which can be unreliable in headless mode.
-    """
-    import mathutils
-
-    bpy.context.view_layer.objects.active = obj
-    obj.select_set(True)
-
-    # Make sure any pending transforms are applied first so the mesh data is
-    # in world space (scale/rotation already applied by scale_to_spec).
-    bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
-
-    # Compute bounding box in local (now == world) space
-    mesh = obj.data
-    verts = mesh.vertices
-    xs = [v.co.x for v in verts]
-    ys = [v.co.y for v in verts]
-    zs = [v.co.z for v in verts]
-
-    cx = (max(xs) + min(xs)) / 2.0
-    cy = (max(ys) + min(ys)) / 2.0
-    cz_min = min(zs)   # base = floor in Blender Z-up
-
-    # Shift all vertices so base-center lands at origin
-    offset = mathutils.Vector((-cx, -cy, -cz_min))
-    mesh.transform(mathutils.Matrix.Translation(offset))
-    mesh.update()
-
-    # Also zero the object location (it was already 0 after transform_apply)
-    obj.location = (0.0, 0.0, 0.0)
-
-    log.info(
-        "Pivot set to base-center for %s (shifted by %.4f, %.4f, %.4f)",
-        obj.name, -cx, -cy, -cz_min,
-    )
-
-
-def apply_transforms(bpy, obj):
-    """Apply all transforms so export is clean."""
-    bpy.context.view_layer.objects.active = obj
-    obj.select_set(True)
-    bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
-    log.info("Transforms applied for %s", obj.name)
-
-
-def create_pbr_material(bpy, obj, spec_materials: list, texture_res: int, out_dir: Path):
-    """
-    Create a PBR node-based material from asset_spec materials.
-    Bakes baseColor, normal, roughness, metallic, AO to image textures.
-    """
-    import bpy as _bpy
-
-    # ── Create material ──────────────────────────────────────────────────────
-    mat_name = f"{obj.name}_PBR"
-    mat = _bpy.data.materials.get(mat_name) or _bpy.data.materials.new(name=mat_name)
-    mat.use_nodes = True
-    nodes = mat.node_tree.nodes
-    links = mat.node_tree.links
-    nodes.clear()
-
-    # Principled BSDF
-    bsdf  = nodes.new("ShaderNodeBsdfPrincipled")
-    out_n = nodes.new("ShaderNodeOutputMaterial")
-    links.new(bsdf.outputs["BSDF"], out_n.inputs["Surface"])
-
-    # Apply first material part values (extend for multi-material later)
-    if spec_materials:
-        pbr = spec_materials[0].get("pbr", {})
-        base_hex = pbr.get("baseColor", "#808080")
-        metallic  = float(pbr.get("metallic",  0.0))
-        roughness = float(pbr.get("roughness", 0.5))
-
-        # Convert hex to linear RGB
-        r, g, b = _hex_to_linear(base_hex)
-        bsdf.inputs["Base Color"].default_value    = (r, g, b, 1.0)
-        bsdf.inputs["Metallic"].default_value      = metallic
-        bsdf.inputs["Roughness"].default_value     = roughness
-
-        emissive = pbr.get("emissive")
-        if emissive:
-            er, eg, eb = _hex_to_linear(emissive)
-            bsdf.inputs["Emission Color"].default_value  = (er, eg, eb, 1.0)
-            bsdf.inputs["Emission Strength"].default_value = 1.0
-
-    # Assign material to object
-    if obj.data.materials:
-        obj.data.materials[0] = mat
-    else:
-        obj.data.materials.append(mat)
-
-    # ── Bake maps ────────────────────────────────────────────────────────────
-    tex_dir = out_dir / "textures"
-    tex_dir.mkdir(parents=True, exist_ok=True)
-
-    bake_configs = [
-        ("DIFFUSE",   "baseColor",  "sRGB"),
-        ("NORMAL",    "normal",     "Non-Color"),
-        ("ROUGHNESS", "roughness",  "Non-Color"),
-        ("AO",        "ao",         "Non-Color"),
-    ]
-
-    # Track created image nodes keyed by bake_type so we can wire them up after baking.
-    baked_nodes: dict[str, object] = {}
-
-    for bake_type, tex_name, colorspace in bake_configs:
-        img_name = f"{obj.name}_{tex_name}"
-        img = _bpy.data.images.new(
-            img_name, width=texture_res, height=texture_res, alpha=False
-        )
-        img.colorspace_settings.name = colorspace
-
-        # Add image texture node (selected but NOT connected during bake)
-        img_node = nodes.new("ShaderNodeTexImage")
-        img_node.image = img
-        nodes.active = img_node
-
-        _bpy.context.view_layer.objects.active = obj
-        obj.select_set(True)
-
-        # Configure render engine for baking
-        _bpy.context.scene.render.engine = "CYCLES"
-        _bpy.context.scene.cycles.samples = 16  # low for speed; increase for quality
-
-        bake_ok = False
-        try:
-            if bake_type == "DIFFUSE":
-                _bpy.ops.object.bake(
-                    type="DIFFUSE", pass_filter={"COLOR"},
-                    use_selected_to_active=False,
-                )
-            elif bake_type == "NORMAL":
-                _bpy.ops.object.bake(type="NORMAL", use_selected_to_active=False)
-            elif bake_type == "ROUGHNESS":
-                _bpy.ops.object.bake(type="ROUGHNESS", use_selected_to_active=False)
-            elif bake_type == "AO":
-                _bpy.ops.object.bake(type="AO", use_selected_to_active=False)
-
-            img_path = str(tex_dir / f"{tex_name}.png")
-            img.filepath_raw = img_path
-            img.file_format  = "PNG"
-            img.save()
-
-            # Pack the baked image into the Blender file so it is embedded in
-            # the exported GLB (without this pack() call, the GLB will reference
-            # an external file path that does not exist in the container).
-            img.pack()
-            log.info("Baked and packed %s → %s", bake_type, img_path)
-            bake_ok = True
-
-        except Exception as exc:
-            log.warning("Bake %s failed (will use flat values): %s", bake_type, exc)
-            nodes.remove(img_node)
-            img_node = None
-
-        if bake_ok and img_node is not None:
-            baked_nodes[bake_type] = img_node
-        elif img_node is not None:
-            nodes.remove(img_node)
-
-    # ── Wire baked textures into the BSDF so the GLB exporter picks them up ──
-    # DIFFUSE → Base Color
-    if "DIFFUSE" in baked_nodes:
-        links.new(baked_nodes["DIFFUSE"].outputs["Color"], bsdf.inputs["Base Color"])
-        log.info("Wired DIFFUSE texture to Base Color")
-
-    # NORMAL → Normal (via Normal Map node)
-    if "NORMAL" in baked_nodes:
-        nrm_map = nodes.new("ShaderNodeNormalMap")
-        links.new(baked_nodes["NORMAL"].outputs["Color"], nrm_map.inputs["Color"])
-        links.new(nrm_map.outputs["Normal"], bsdf.inputs["Normal"])
-        log.info("Wired NORMAL texture to Normal")
-
-    # ROUGHNESS → Roughness
-    if "ROUGHNESS" in baked_nodes:
-        links.new(baked_nodes["ROUGHNESS"].outputs["Color"], bsdf.inputs["Roughness"])
-        log.info("Wired ROUGHNESS texture to Roughness")
-
-    # AO is informational only (baked into the baseColor in a real workflow);
-    # leave it packed but unconnected for now.
-
-    return mat
-
-
-def export_glb(bpy, out_path: str):
-    """Export the active scene as GLB with PBR materials."""
-    bpy.ops.object.select_all(action="SELECT")
-    bpy.ops.export_scene.gltf(
-        filepath=out_path,
-        export_format="GLB",
-        export_image_format="AUTO",   # valid: AUTO, JPEG, NONE (PNG removed in Blender 3.x+)
-        export_materials="EXPORT",
-        export_normals=True,
-        export_texcoords=True,
-        export_apply=True,
-        use_selection=False,
-    )
-    log.info("GLB exported: %s (%.1f KB)", out_path, Path(out_path).stat().st_size / 1024)
-
-
 # ---------------------------------------------------------------------------
-# Helpers
+# Hex → linear RGBA
 # ---------------------------------------------------------------------------
-def _hex_to_linear(hex_str: str) -> tuple[float, float, float]:
-    """Convert #RRGGBB hex to linear float triple."""
+def _hex_to_linear_rgba(hex_str: str) -> list[float]:
     hex_str = hex_str.lstrip("#")
     if len(hex_str) == 3:
         hex_str = "".join(c * 2 for c in hex_str)
-    r, g, b = (int(hex_str[i:i+2], 16) / 255.0 for i in (0, 2, 4))
-    # sRGB → linear
-    def to_lin(c): return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
-    return to_lin(r), to_lin(g), to_lin(b)
+    r, g, b = (int(hex_str[i : i + 2], 16) / 255.0 for i in (0, 2, 4))
+
+    def to_lin(c):
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+    return [to_lin(r), to_lin(g), to_lin(b), 1.0]
 
 
 # ---------------------------------------------------------------------------
-# Main entry
+# Main cleanup pipeline
 # ---------------------------------------------------------------------------
 def main():
-    try:
-        import bpy
-    except ImportError:
-        print("ERROR: This script must be run inside Blender (--background --python)")
-        sys.exit(1)
+    args   = parse_args()
+    spec   = json.loads(Path(args.spec).read_text())
 
-    args = parse_args()
+    gen_plan  = spec.get("generation_plan", {})
+    qt        = gen_plan.get("quality_targets", {})
+    max_tris  = int(qt.get("max_tris", 80_000))
+    spec_mats = spec.get("object", {}).get("materials", [])
+    spec_size = spec.get("object", {}).get("size_m", {})
 
-    input_path  = args.input
-    output_path = args.output
-    spec_path   = args.spec
+    import trimesh
+    import numpy as np
 
-    out_dir     = Path(output_path).parent
-    spec        = json.loads(Path(spec_path).read_text())
+    # ── Load ─────────────────────────────────────────────────────────────────
+    log.info("Loading mesh: %s", args.input)
+    scene = trimesh.load(args.input, force="scene", process=False)
 
-    gen_plan    = spec.get("generation_plan", {})
-    qt          = gen_plan.get("quality_targets", {})
-    max_tris    = int(qt.get("max_tris",          80000))
-    tex_res     = int(qt.get("texture_resolution", 2048))
-    spec_mats   = spec.get("object", {}).get("materials", [])
+    if isinstance(scene, trimesh.Trimesh):
+        mesh = scene
+    elif isinstance(scene, trimesh.Scene):
+        meshes = [g for g in scene.geometry.values() if isinstance(g, trimesh.Trimesh)]
+        if not meshes:
+            raise RuntimeError(f"No mesh geometry found in {args.input}")
+        mesh = trimesh.util.concatenate(meshes)
+    else:
+        raise RuntimeError(f"Unexpected scene type: {type(scene)}")
 
-    # ── Clear default scene ──────────────────────────────────────────────────
-    bpy.ops.object.select_all(action="SELECT")
-    bpy.ops.object.delete()
-    for block in bpy.data.meshes:
-        bpy.data.meshes.remove(block)
+    log.info("Loaded: %d verts, %d faces", len(mesh.vertices), len(mesh.faces))
 
-    # ── Import ───────────────────────────────────────────────────────────────
-    objects = import_mesh(bpy, input_path)
-    if not objects:
-        raise RuntimeError(f"No mesh objects imported from {input_path}")
+    # ── Merge duplicate vertices ──────────────────────────────────────────────
+    mesh.merge_vertices()
 
-    obj = join_objects(bpy, objects)
+    # ── Remove degenerate/duplicate faces ────────────────────────────────────
+    # trimesh API differs across versions (some methods were renamed/removed).
+    remove_degenerate = getattr(mesh, "remove_degenerate_faces", None)
+    if callable(remove_degenerate):
+        remove_degenerate()
+    else:
+        mesh.update_faces(mesh.nondegenerate_faces())
 
-    # ── Cleanup pipeline ─────────────────────────────────────────────────────
-    remove_doubles_and_artifacts(bpy, obj)
-    fix_normals(bpy, obj)
-    triangulate(bpy, obj)
-    decimate(bpy, obj, max_tris)
-    smart_uv_unwrap(bpy, obj)
+    remove_duplicate = getattr(mesh, "remove_duplicate_faces", None)
+    if callable(remove_duplicate):
+        remove_duplicate()
+    else:
+        mesh.update_faces(mesh.unique_faces())
+
+    mesh.remove_unreferenced_vertices()
+
+    # ── Fix winding / normals ─────────────────────────────────────────────────
+    trimesh.repair.fix_winding(mesh)
+    trimesh.repair.fix_normals(mesh)
+
+    # ── Decimate to max_tris ──────────────────────────────────────────────────
+    current_tris = len(mesh.faces)
+    if current_tris > max_tris:
+        ratio = max_tris / current_tris
+        log.info("Decimating %d → target %d tris (ratio=%.3f)", current_tris, max_tris, ratio)
+        mesh = mesh.simplify_quadric_decimation(max_tris)
+        log.info("After decimate: %d faces", len(mesh.faces))
 
     # ── Scale to spec dimensions ──────────────────────────────────────────────
-    spec_size = spec.get("object", {}).get("size_m", {})
-    scale_to_spec(bpy, obj, spec_size)
+    if spec_size:
+        extents = mesh.bounding_box.extents  # [x, y, z]
+        tgt = [float(spec_size.get("x", 0)), float(spec_size.get("y", 0)), float(spec_size.get("z", 0))]
+        scale_vec = np.array([
+            tgt[0] / extents[0] if (tgt[0] > 0 and extents[0] > 1e-6) else 1.0,
+            tgt[1] / extents[1] if (tgt[1] > 0 and extents[1] > 1e-6) else 1.0,
+            tgt[2] / extents[2] if (tgt[2] > 0 and extents[2] > 1e-6) else 1.0,
+        ])
+        mesh.apply_scale(scale_vec)
+        log.info("Scaled to spec: %s", tgt)
 
-    # ── PBR material ─────────────────────────────────────────────────────────
-    create_pbr_material(bpy, obj, spec_mats, tex_res, out_dir)
+    # ── Move pivot to base-center (Y-up: min-Y face, centered on X/Z) ────────
+    bounds   = mesh.bounds          # [[minx,miny,minz],[maxx,maxy,maxz]]
+    cx       = (bounds[0][0] + bounds[1][0]) / 2.0
+    cy_min   = bounds[0][1]         # base in Y-up
+    cz       = (bounds[0][2] + bounds[1][2]) / 2.0
+    mesh.apply_translation([-cx, -cy_min, -cz])
+    log.info("Pivot set to base-center (shifted %.4f, %.4f, %.4f)", -cx, -cy_min, -cz)
 
-    # ── Pivot to base-center (vertices shifted directly, transforms frozen) ──
-    set_pivot_to_base_center(bpy, obj)
+    # ── Apply PBR material as vertex colors + GLTF material constants ─────────
+    pbr_values = {"baseColor": "#808080", "metallic": 0.0, "roughness": 0.5}
+    if spec_mats:
+        pbr_values.update(spec_mats[0].get("pbr", {}))
 
-    # ── Export ───────────────────────────────────────────────────────────────
-    export_glb(bpy, output_path)
-    log.info("cleanup_and_bake.py complete → %s", output_path)
+    base_color_linear = _hex_to_linear_rgba(pbr_values.get("baseColor", "#808080"))
+    metallic          = float(pbr_values.get("metallic",  0.0))
+    roughness         = float(pbr_values.get("roughness", 0.5))
+
+    # Paint every vertex with the base colour (sRGB encoded for trimesh vertex_colors)
+    def _lin_to_srgb(c):
+        return c * 12.92 if c <= 0.0031308 else 1.055 * (c ** (1 / 2.4)) - 0.055
+
+    srgb = [_lin_to_srgb(c) for c in base_color_linear[:3]]
+    color_uint8 = [max(0, min(255, int(round(c * 255)))) for c in srgb] + [255]
+    mesh.visual = trimesh.visual.ColorVisuals(
+        mesh=mesh,
+        vertex_colors=np.tile(color_uint8, (len(mesh.vertices), 1)).astype(np.uint8),
+    )
+
+    # ── Export to GLB ─────────────────────────────────────────────────────────
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    log.info("Exporting GLB: %s", out_path)
+    exported = trimesh.exchange.gltf.export_glb(mesh)
+    out_path.write_bytes(exported)
+
+    # ── Patch GLTF material to add metallic/roughness constants ──────────────
+    # trimesh's vertex-color export doesn't set metallicFactor/roughnessFactor.
+    # We patch them directly into the binary GLTF JSON chunk.
+    _patch_glb_material(out_path, base_color_linear, metallic, roughness)
+
+    kb = out_path.stat().st_size / 1024
+    log.info("GLB written: %s (%.1f KB)", out_path, kb)
+
+
+# ---------------------------------------------------------------------------
+# GLB material patcher
+# ---------------------------------------------------------------------------
+def _patch_glb_material(
+    glb_path: Path,
+    base_color: list[float],
+    metallic: float,
+    roughness: float,
+) -> None:
+    """
+    Parse the GLB binary, locate the JSON chunk, inject PBR material values,
+    rewrite the file.  GLB format: 12-byte header + chunk0 (JSON) + chunk1 (BIN).
+    """
+    import json as _json
+
+    data = glb_path.read_bytes()
+    if len(data) < 12:
+        return
+
+    # GLB header
+    magic, version, total_len = struct.unpack_from("<III", data, 0)
+    if magic != 0x46546C67:   # "glTF"
+        log.warning("Not a valid GLB, skipping material patch")
+        return
+
+    # Chunk 0 (JSON)
+    chunk0_len, chunk0_type = struct.unpack_from("<II", data, 12)
+    if chunk0_type != 0x4E4F534A:  # "JSON"
+        log.warning("GLB chunk 0 is not JSON, skipping material patch")
+        return
+
+    json_bytes = data[20 : 20 + chunk0_len]
+    gltf = _json.loads(json_bytes.rstrip(b"\x20"))
+
+    # Ensure materials list exists with at least one entry
+    if "materials" not in gltf or not gltf["materials"]:
+        gltf["materials"] = [{"name": "mat0"}]
+
+    mat = gltf["materials"][0]
+    pbr = mat.setdefault("pbrMetallicRoughness", {})
+    pbr["baseColorFactor"]         = base_color
+    pbr["metallicFactor"]          = metallic
+    pbr["roughnessFactor"]         = roughness
+    mat["doubleSided"]             = False
+
+    # Re-serialise + pad to 4-byte boundary
+    new_json = _json.dumps(gltf, separators=(",", ":")).encode("utf-8")
+    pad = (4 - len(new_json) % 4) % 4
+    new_json_padded = new_json + b" " * pad
+
+    # Rebuild file
+    new_chunk0_header = struct.pack("<II", len(new_json_padded), 0x4E4F534A)
+    rest = data[20 + chunk0_len :]                   # BIN chunk + any trailing
+
+    new_total = 12 + 8 + len(new_json_padded) + len(rest)
+    new_header = struct.pack("<III", 0x46546C67, 2, new_total)
+
+    glb_path.write_bytes(new_header + new_chunk0_header + new_json_padded + rest)
+    log.info("GLB material patched: baseColor=%s metallic=%.2f roughness=%.2f",
+             base_color[:3], metallic, roughness)
 
 
 if __name__ == "__main__":

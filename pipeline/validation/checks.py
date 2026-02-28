@@ -265,18 +265,37 @@ def check_realistic_scale(glb_path, asset_spec, world_context, mesh=None, **_):
 
 
 def check_textures_present(glb_path, **_):
-    """Check GLB file embeds at least one texture."""
+    """Check GLB has either embedded textures or vertex colors."""
     try:
         import pygltflib
+        import trimesh
 
-        glb = pygltflib.GLTF2().load(str(glb_path))
-        num_textures = len(glb.textures or [])
-        num_images   = len(glb.images   or [])
-        ok = num_textures > 0 and num_images > 0
+        glb = pygltflib.GLTF2()
+        glb.load(str(glb_path))
+        num_textures = len(getattr(glb, "textures", None) or [])
+        num_images   = len(getattr(glb, "images", None) or [])
+
+        has_textures = num_textures > 0 and num_images > 0
+
+        # Our fast Stage C path can intentionally ship colorized vertex data
+        # with PBR constants and no texture images.
+        has_vertex_colors = False
+        scene = trimesh.load(str(glb_path), force="scene")
+        meshes = _extract_meshes(scene)
+        for mesh in meshes:
+            vc = getattr(getattr(mesh, "visual", None), "vertex_colors", None)
+            if vc is not None and len(vc) > 0:
+                has_vertex_colors = True
+                break
+
+        ok = has_textures or has_vertex_colors
         return {
             "name":    "check_textures_present",
             "passed":  ok,
-            "message": f"{num_textures} texture(s), {num_images} image(s) in GLB",
+            "message": (
+                f"{num_textures} texture(s), {num_images} image(s), "
+                f"vertex_colors={has_vertex_colors}"
+            ),
         }
     except Exception as exc:
         return {

@@ -1,0 +1,10 @@
+{
+  "zone_id": "tool_storage_area",
+  "surface_id": "workbench_01",
+  "approximate_position": {
+    "x": 1.8,
+    "y": 0.90,
+    "z": 0.1
+  },
+  "note": "Place near the right end of the workbench, away from the drill press"
+}

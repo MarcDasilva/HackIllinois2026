@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 
 const CONTROLS = [
   { icon: '⇥',   action: 'Drag to look around',   kbd: false },
@@ -11,8 +11,22 @@ const CONTROLS = [
   { icon: '⇧',   action: '4× speed boost',         kbd: true  },
 ];
 
-export default function Hud({ fileName, isLoading, loadProgress, error, onReset }) {
+export default function Hud({ fileName, isLoading, loadProgress, error, onReset, onPrompt }) {
   const [controlsOpen, setControlsOpen] = useState(false);
+  const [prompt, setPrompt] = useState('');
+  const [isFocused, setIsFocused] = useState(false);
+  const inputRef = useRef(null);
+
+  function handleSubmit() {
+    const trimmed = prompt.trim();
+    if (!trimmed) return;
+    if (onPrompt) onPrompt(trimmed);
+    setPrompt('');
+  }
+
+  function handleKeyDown(e) {
+    if (e.key === 'Enter') handleSubmit();
+  }
 
   return (
     <>
@@ -87,6 +101,35 @@ export default function Hud({ fileName, isLoading, loadProgress, error, onReset 
         </div>
       )}
 
+      {/* ── Bottom: prompt bar (shown when not loading and no error) ── */}
+      {!isLoading && !error && (
+        <div style={styles.promptBarWrap}>
+          <div style={{ ...styles.promptBar, ...(isFocused ? styles.promptBarFocused : {}) }}>
+            <SearchIcon />
+            <input
+              ref={inputRef}
+              type="text"
+              placeholder="Describe what to generate in this scene…"
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              onKeyDown={handleKeyDown}
+              onFocus={() => setIsFocused(true)}
+              onBlur={() => setIsFocused(false)}
+              style={styles.promptInput}
+            />
+            <button
+              style={{ ...styles.generateBtn, ...(prompt.trim() ? styles.generateBtnActive : {}) }}
+              onClick={handleSubmit}
+              disabled={!prompt.trim()}
+              title="Generate"
+            >
+              <SendIcon />
+              <span>Generate</span>
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* ── Error overlay ── */}
       {error && (
         <div style={styles.errorOverlay}>
@@ -105,6 +148,29 @@ export default function Hud({ fileName, isLoading, loadProgress, error, onReset 
 
 function truncate(str, max) {
   return str.length > max ? '…' + str.slice(-(max - 1)) : str;
+}
+
+function SearchIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" style={{ flexShrink: 0, color: '#52525b' }}>
+      <circle cx="7" cy="7" r="4.5" stroke="currentColor" strokeWidth="1.3" />
+      <path d="M10.5 10.5L13 13" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function SendIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+      <path
+        d="M14 8L2 2l2.5 6L2 14l12-6z"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinejoin="round"
+        fill="none"
+      />
+    </svg>
+  );
 }
 
 function FolderIcon() {
@@ -329,6 +395,74 @@ const styles = {
     background: 'linear-gradient(90deg, #6366f1, #818cf8)',
     borderRadius: 2,
     transition: 'width 0.3s ease',
+  },
+
+  promptBarWrap: {
+    position: 'fixed',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    padding: '0 24px 24px',
+    pointerEvents: 'none',
+    display: 'flex',
+    justifyContent: 'center',
+  },
+
+  promptBar: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+    background: 'rgba(10,10,16,0.88)',
+    border: '1px solid rgba(255,255,255,0.09)',
+    borderRadius: 14,
+    padding: '10px 12px 10px 14px',
+    backdropFilter: 'blur(20px)',
+    width: '100%',
+    maxWidth: 640,
+    pointerEvents: 'auto',
+    transition: 'border-color 0.2s, box-shadow 0.2s',
+    boxShadow: '0 4px 24px rgba(0,0,0,0.4)',
+  },
+
+  promptBarFocused: {
+    borderColor: 'rgba(129,140,248,0.35)',
+    boxShadow: '0 4px 24px rgba(0,0,0,0.4), 0 0 0 3px rgba(129,140,248,0.08)',
+  },
+
+  promptInput: {
+    flex: 1,
+    background: 'transparent',
+    border: 'none',
+    outline: 'none',
+    color: '#e4e4e7',
+    fontSize: 14,
+    lineHeight: 1.5,
+    caretColor: '#818cf8',
+    fontFamily: 'inherit',
+  },
+
+  generateBtn: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+    flexShrink: 0,
+    background: 'rgba(255,255,255,0.05)',
+    border: '1px solid rgba(255,255,255,0.08)',
+    borderRadius: 9,
+    color: '#52525b',
+    fontSize: 13,
+    fontWeight: 500,
+    padding: '6px 14px',
+    cursor: 'not-allowed',
+    transition: 'background 0.15s, color 0.15s, border-color 0.15s',
+    fontFamily: 'inherit',
+  },
+
+  generateBtnActive: {
+    background: 'rgba(129,140,248,0.15)',
+    border: '1px solid rgba(129,140,248,0.3)',
+    color: '#818cf8',
+    cursor: 'pointer',
   },
 
   errorOverlay: {

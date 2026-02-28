@@ -1,0 +1,56 @@
+{
+  "world_id": "demo_world_001",
+  "units": "meters",
+  "up_axis": "Y",
+  "style": {
+    "rendering": "photoreal",
+    "materials": "PBR",
+    "dominant_palette": ["#3B2F2F", "#8B7355", "#C0A882", "#F5F0E8"],
+    "wear_level": "lightly_used",
+    "lighting": {
+      "type": "soft indoor",
+      "temp_k": 4300,
+      "hdri": "workshop_interior"
+    }
+  },
+  "physics": {
+    "gravity": 9.81
+  },
+  "surfaces": [
+    {
+      "id": "workbench_01",
+      "type": "plane",
+      "pose": { "x": 1.2, "y": 0.9, "z": 0.0, "rx": 0, "ry": 0, "rz": 0 },
+      "bbox": {
+        "min_x": 0.2,  "max_x": 2.2,
+        "min_y": 0.88, "max_y": 0.90,
+        "min_z": -0.4, "max_z": 0.8,
+        "center_x": 1.2, "center_z": 0.2
+      },
+      "material": "wood_worn",
+      "allowed_placements": ["tools", "boxes", "electronics", "containers"]
+    },
+    {
+      "id": "floor_01",
+      "type": "plane",
+      "pose": { "x": 0.0, "y": 0.0, "z": 0.0 },
+      "bbox": {
+        "min_x": -5.0, "max_x": 5.0,
+        "min_y": -0.01,"max_y": 0.01,
+        "min_z": -5.0, "max_z": 5.0,
+        "center_x": 0.0, "center_z": 0.0
+      },
+      "material": "concrete_worn",
+      "allowed_placements": ["furniture", "large_equipment", "boxes"]
+    }
+  ],
+  "occupied_regions": [
+    {
+      "id": "drill_press_zone",
+      "bbox": { "min_x": 0.5, "max_x": 1.0, "min_z": -0.2, "max_z": 0.3 }
+    }
+  ],
+  "semantic_zones": [
+    { "id": "tool_storage_area", "bbox": { "min_x": 0.0, "max_x": 2.5, "min_z": -0.5, "max_z": 1.0 } }
+  ]
+}
